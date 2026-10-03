@@ -1,4 +1,5 @@
 name: RDP
+
 on:
   workflow_dispatch:
 
@@ -6,50 +7,67 @@ jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
-      - name: Configure RDP
-        shell: pwsh
+      - name: Check secrets
+        env:
+          P: ${{ secrets.RDP_PASSWORD }}
+          K: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          if (-not $env:P) { Write-Error "Secret RDP_PASSWORD belum diisi"; exit 1 }
+          if (-not $env:K) { Write-Error "Secret TAILSCALE_AUTH_KEY belum diisi"; exit 1 }
+
+      - name: Enable RDP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
           Restart-Service -Name TermService -Force
 
       - name: Create RDP user
-        shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $username = "JoyWardana"
-          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) { exit 1 }
+          $ErrorActionPreference = 'Stop'
+          $user = "JoyWardana"
+          $pass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $pass
+          } else {
+            New-LocalUser -Name $user -Password $pass -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+          Write-Host "User $user siap"
 
       - name: Install Tailscale
-        shell: pwsh
         run: |
-          $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installer -Force
+          $ErrorActionPreference = 'Stop'
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Remove-Item $msi -Force
+          Start-Sleep -Seconds 10
 
       - name: Connect Tailscale
-        shell: pwsh
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          Start-Sleep -Seconds 5
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname="gh-runner-$env:GITHUB_RUN_ID"
-          $tsIP = (& $ts ip -4).Trim()
-          Write-Host "Connect via RDP ke: $tsIP (user: JoyWardana)"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-runner-$env:GITHUB_RUN_ID" --unattended
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          Write-Host "======================================"
+          Write-Host "RDP ke : $ip"
+          Write-Host "User   : JoyWardana"
+          Write-Host "======================================"
 
       - name: Keep alive
-        shell: pwsh
         run: |
-          # Buat file C:\stop.txt (via RDP) untuk menghentikan workflow
+          # Buat file C:\stop.txt lewat RDP untuk menghentikan workflow
           while (-not (Test-Path "C:\stop.txt")) { Start-Sleep -Seconds 30 }
