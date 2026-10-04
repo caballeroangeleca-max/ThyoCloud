@@ -3,6 +3,10 @@ name: RDP
 on:
   workflow_dispatch:
 
+env:
+  GAME_LINK: "https://drive.google.com/drive/folders/18Q4_tkFbHlEcdUkCvoVRjNBY4wxi5fVG"
+  RCLONE_CONFIG: C:\rclone.conf
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -19,19 +23,6 @@ jobs:
         run: |
           if (-not $env:P) { Write-Error "Secret RDP_PASSWORD belum diisi"; exit 1 }
           if (-not $env:K) { Write-Error "Secret TAILSCALE_AUTH_KEY belum diisi"; exit 1 }
-
-      - name: Restore data lama
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\Persist
-          key: persist-${{ github.run_id }}
-          restore-keys: persist-
-
-      - name: Siapkan folder Persist
-        run: |
-          New-Item -ItemType Directory -Force -Path C:\Persist\Saves | Out-Null
-          New-Item -ItemType Directory -Force -Path C:\Persist\Games | Out-Null
-          if (-not (Test-Path C:\Persist\.keep)) { "init" | Out-File C:\Persist\.keep }
 
       - name: Enable RDP
         run: |
@@ -58,7 +49,6 @@ jobs:
           }
           Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
-          Write-Host "User $user siap"
 
       - name: Install Tailscale
         run: |
@@ -80,28 +70,47 @@ jobs:
           Write-Host "======================================"
           Write-Host "RDP ke  : $ip"
           Write-Host "User    : JoyWardana"
+          Write-Host "Game    : C:\Games\game"
           Write-Host "Saves   : C:\Persist\Saves"
-          Write-Host "Games   : C:\Persist\Games"
           Write-Host "======================================"
+
+      - name: Siapkan folder
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\Games, C:\Persist\Saves | Out-Null
+
+      - name: Download game dari Google Drive
+        run: |
+          pip install gdown --quiet
+          if ($env:GAME_LINK -match "/folders/") {
+            gdown --folder "$env:GAME_LINK" -O C:\Games\game
+          } else {
+            gdown --fuzzy "$env:GAME_LINK" -O C:\Games\game.zip
+            if ($LASTEXITCODE -eq 0 -and (Test-Path C:\Games\game.zip)) {
+              try { Expand-Archive C:\Games\game.zip -DestinationPath C:\Games\game -Force; Remove-Item C:\Games\game.zip }
+              catch { Write-Host "Bukan file zip, dibiarkan apa adanya" }
+            }
+          }
+          Get-ChildItem C:\Games\game -ErrorAction SilentlyContinue | Format-Table Name,Length
+
+      - name: Restore save dari Google Drive
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          if (-not $env:RCLONE_CONF) { Write-Host "RCLONE_CONF kosong, sync save dilewati"; exit 0 }
+          $env:RCLONE_CONF | Out-File -Encoding ascii C:\rclone.conf
+          Invoke-WebRequest "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile $env:TEMP\rclone.zip
+          Expand-Archive $env:TEMP\rclone.zip -DestinationPath $env:TEMP\rc -Force
+          Copy-Item (Get-ChildItem $env:TEMP\rc -Recurse -Filter rclone.exe | Select-Object -First 1).FullName C:\rclone.exe
+          & C:\rclone.exe copy gdrive:RDP-Saves C:\Persist\Saves --progress
 
       - name: Keep alive
         run: |
-          # Berhenti otomatis di menit ke-335 supaya data sempat disimpan
-          # Atau buat file C:\stop.txt lewat RDP untuk berhenti lebih awal
+          # Buat file C:\stop.txt lewat RDP untuk berhenti dan menyimpan save
           $end = (Get-Date).AddMinutes(335)
           while ((Get-Date) -lt $end -and -not (Test-Path "C:\stop.txt")) { Start-Sleep -Seconds 30 }
 
-      - name: Simpan ke cache
+      - name: Upload save ke Google Drive
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\Persist
-          key: persist-${{ github.run_id }}
-
-      - name: Upload artifact (bisa didownload)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: saves-${{ github.run_id }}
-          path: C:\Persist\Saves
-          retention-days: 7
+        run: |
+          if (-not (Test-Path C:\rclone.exe)) { Write-Host "rclone tidak ada, dilewati"; exit 0 }
+          & C:\rclone.exe copy C:\Persist\Saves gdrive:RDP-Saves --progress
