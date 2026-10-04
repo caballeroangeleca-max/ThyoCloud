@@ -3,10 +3,6 @@ name: RDP
 on:
   workflow_dispatch:
 
-env:
-  GAME_LINK: "https://drive.google.com/drive/folders/18Q4_tkFbHlEcdUkCvoVRjNBY4wxi5fVG"
-  RCLONE_CONFIG: C:\rclone.conf
-
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -24,11 +20,14 @@ jobs:
           if (-not $env:P) { Write-Error "Secret RDP_PASSWORD belum diisi"; exit 1 }
           if (-not $env:K) { Write-Error "Secret TAILSCALE_AUTH_KEY belum diisi"; exit 1 }
 
-      - name: Enable RDP
+      - name: Enable RDP + izinkan storage HP
         run: |
           $ErrorActionPreference = 'Stop'
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          $ts = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $ts -Name fDenyTSConnections -Value 0 -Force
+          Set-ItemProperty -Path $ts -Name fDisableCdm -Value 0 -Force
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1 -Force
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name fDisableCdm -Value 0 -Force
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           netsh advfirewall firewall delete rule name="RDP-Any" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Any" dir=in action=allow protocol=TCP localport=3389 profile=any
@@ -50,6 +49,70 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
 
+      - name: Siapkan sync HP
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\RDPTools, C:\GameSaves, D:\MT2 | Out-Null
+          icacls C:\GameSaves /grant "Everyone:(OI)(CI)F" | Out-Null
+          icacls D:\MT2 /grant "Everyone:(OI)(CI)F" | Out-Null
+          icacls C:\RDPTools /grant "Everyone:(OI)(CI)F" | Out-Null
+
+          $script = @'
+          param([string]$Mode = 'loop')
+          $game = 'D:\MT2'
+          $save = 'C:\GameSaves'
+          $log  = 'C:\RDPTools\sync.log'
+          function Log($m) { "$(Get-Date -Format 'HH:mm:ss') $m" | Add-Content $log }
+
+          function Get-Mt2 {
+            $base = (Get-ChildItem '\\tsclient' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+            if (-not $base) { return $null }
+            if (Test-Path "$base\MT2") { return "$base\MT2" }
+            $f = Get-ChildItem $base -Directory -Recurse -Depth 3 -Filter MT2 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) { return $f.FullName }
+            return $null
+          }
+
+          function Wait-Phone {
+            while ($true) {
+              $m = Get-Mt2
+              if ($m) { return $m }
+              Log "Folder MT2 di HP belum ketemu, coba lagi..."
+              Start-Sleep -Seconds 10
+            }
+          }
+
+          $mt2 = Wait-Phone
+          $phoneSaves = Join-Path (Split-Path $mt2 -Parent) 'MT2_Saves'
+          New-Item -ItemType Directory -Force -Path $phoneSaves | Out-Null
+          Log "MT2 = $mt2 | Saves HP = $phoneSaves"
+
+          switch ($Mode) {
+            'game' { robocopy $mt2 $game /E /R:1 /W:1 /NP | Out-Null; Log "Game disalin ke $game" }
+            'pull' { robocopy $phoneSaves $save /E /R:1 /W:1 /NP | Out-Null; Log "Save diambil dari HP" }
+            'push' { robocopy $save $phoneSaves /E /R:1 /W:1 /NP | Out-Null; Log "Save dikirim ke HP" }
+            'loop' {
+              robocopy $phoneSaves $save /E /R:1 /W:1 /NP | Out-Null
+              Log "Save lama dipulihkan, autosave jalan tiap 2 menit"
+              while ($true) {
+                Start-Sleep -Seconds 120
+                if (Test-Path $phoneSaves) {
+                  robocopy $save $phoneSaves /E /R:1 /W:1 /NP | Out-Null
+                  Log "Autosave ke HP"
+                }
+              }
+            }
+          }
+          '@
+          $script | Set-Content -Path C:\RDPTools\sync.ps1 -Encoding UTF8
+
+          Set-Content -Path C:\Users\Public\Desktop\Ambil-Game.bat -Value "@echo off`r`npowershell -ExecutionPolicy Bypass -File C:\RDPTools\sync.ps1 -Mode game`r`necho Selesai. Game ada di D:\MT2`r`npause"
+          Set-Content -Path C:\Users\Public\Desktop\Simpan-Save.bat -Value "@echo off`r`npowershell -ExecutionPolicy Bypass -File C:\RDPTools\sync.ps1 -Mode push`r`necho Save sudah dikirim ke HP`r`npause"
+
+          $a  = New-ScheduledTaskAction -Execute powershell.exe -Argument '-WindowStyle Hidden -ExecutionPolicy Bypass -File C:\RDPTools\sync.ps1 -Mode loop'
+          $t  = New-ScheduledTaskTrigger -AtLogOn -User JoyWardana
+          $pr = New-ScheduledTaskPrincipal -UserId JoyWardana -LogonType Interactive
+          Register-ScheduledTask -TaskName PhoneSync -Action $a -Trigger $t -Principal $pr -Force | Out-Null
+
       - name: Install Tailscale
         run: |
           $ErrorActionPreference = 'Stop'
@@ -68,49 +131,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
           Write-Host "======================================"
-          Write-Host "RDP ke  : $ip"
-          Write-Host "User    : JoyWardana"
-          Write-Host "Game    : C:\Games\game"
-          Write-Host "Saves   : C:\Persist\Saves"
+          Write-Host "RDP ke : $ip"
+          Write-Host "User   : JoyWardana"
+          Write-Host "Game   : D:\MT2 (klik Ambil-Game di Desktop)"
+          Write-Host "Saves  : C:\GameSaves (autosave ke HP tiap 2 menit)"
           Write-Host "======================================"
-
-      - name: Siapkan folder
-        run: |
-          New-Item -ItemType Directory -Force -Path C:\Games, C:\Persist\Saves | Out-Null
-
-      - name: Download game dari Google Drive
-        run: |
-          pip install gdown --quiet
-          if ($env:GAME_LINK -match "/folders/") {
-            gdown --folder "$env:GAME_LINK" -O C:\Games\game
-          } else {
-            gdown --fuzzy "$env:GAME_LINK" -O C:\Games\game.zip
-            if ($LASTEXITCODE -eq 0 -and (Test-Path C:\Games\game.zip)) {
-              try { Expand-Archive C:\Games\game.zip -DestinationPath C:\Games\game -Force; Remove-Item C:\Games\game.zip }
-              catch { Write-Host "Bukan file zip, dibiarkan apa adanya" }
-            }
-          }
-          Get-ChildItem C:\Games\game -ErrorAction SilentlyContinue | Format-Table Name,Length
-
-      - name: Restore save dari Google Drive
-        env:
-          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-        run: |
-          if (-not $env:RCLONE_CONF) { Write-Host "RCLONE_CONF kosong, sync save dilewati"; exit 0 }
-          $env:RCLONE_CONF | Out-File -Encoding ascii C:\rclone.conf
-          Invoke-WebRequest "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile $env:TEMP\rclone.zip
-          Expand-Archive $env:TEMP\rclone.zip -DestinationPath $env:TEMP\rc -Force
-          Copy-Item (Get-ChildItem $env:TEMP\rc -Recurse -Filter rclone.exe | Select-Object -First 1).FullName C:\rclone.exe
-          & C:\rclone.exe copy gdrive:RDP-Saves C:\Persist\Saves --progress
 
       - name: Keep alive
         run: |
-          # Buat file C:\stop.txt lewat RDP untuk berhenti dan menyimpan save
-          $end = (Get-Date).AddMinutes(335)
+          # Buat file C:\stop.txt lewat RDP untuk berhenti
+          $end = (Get-Date).AddMinutes(355)
           while ((Get-Date) -lt $end -and -not (Test-Path "C:\stop.txt")) { Start-Sleep -Seconds 30 }
-
-      - name: Upload save ke Google Drive
-        if: always()
-        run: |
-          if (-not (Test-Path C:\rclone.exe)) { Write-Host "rclone tidak ada, dilewati"; exit 0 }
-          & C:\rclone.exe copy C:\Persist\Saves gdrive:RDP-Saves --progress
