@@ -20,12 +20,27 @@ jobs:
           if (-not $env:P) { Write-Error "Secret RDP_PASSWORD belum diisi"; exit 1 }
           if (-not $env:K) { Write-Error "Secret TAILSCALE_AUTH_KEY belum diisi"; exit 1 }
 
+      - name: Restore data lama
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\Persist
+          key: persist-${{ github.run_id }}
+          restore-keys: persist-
+
+      - name: Siapkan folder Persist
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\Persist\Saves | Out-Null
+          New-Item -ItemType Directory -Force -Path C:\Persist\Games | Out-Null
+          if (-not (Test-Path C:\Persist\.keep)) { "init" | Out-File C:\Persist\.keep }
+
       - name: Enable RDP
         run: |
           $ErrorActionPreference = 'Stop'
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          netsh advfirewall firewall delete rule name="RDP-Any" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Any" dir=in action=allow protocol=TCP localport=3389 profile=any
           Set-Service -Name TermService -StartupType Automatic
           Restart-Service -Name TermService -Force
 
@@ -63,11 +78,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
           Write-Host "======================================"
-          Write-Host "RDP ke : $ip"
-          Write-Host "User   : JoyWardana"
+          Write-Host "RDP ke  : $ip"
+          Write-Host "User    : JoyWardana"
+          Write-Host "Saves   : C:\Persist\Saves"
+          Write-Host "Games   : C:\Persist\Games"
           Write-Host "======================================"
 
       - name: Keep alive
         run: |
-          # Buat file C:\stop.txt lewat RDP untuk menghentikan workflow
-          while (-not (Test-Path "C:\stop.txt")) { Start-Sleep -Seconds 30 }
+          # Berhenti otomatis di menit ke-335 supaya data sempat disimpan
+          # Atau buat file C:\stop.txt lewat RDP untuk berhenti lebih awal
+          $end = (Get-Date).AddMinutes(335)
+          while ((Get-Date) -lt $end -and -not (Test-Path "C:\stop.txt")) { Start-Sleep -Seconds 30 }
+
+      - name: Simpan ke cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\Persist
+          key: persist-${{ github.run_id }}
+
+      - name: Upload artifact (bisa didownload)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: saves-${{ github.run_id }}
+          path: C:\Persist\Saves
+          retention-days: 7
